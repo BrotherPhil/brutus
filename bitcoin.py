@@ -7,7 +7,8 @@
 #
 # Status: much of the protocol is done.  The crypto bits are now
 #   working, and I can verify 'standard' address-to-address transactions.
-#   There's a simple wallet implementation, which can now transact BTC.
+#   There's a simple wallet implementation, which will hopefully soon
+#   be able to transact actual bitcoins.
 # Todo: consider implementing the scripting engine.
 # Todo: actually participate in the p2p network rather than being a lurker.
 #
@@ -39,6 +40,7 @@ BITCOIN_PORT = 8333
 BITCOIN_MAGIC = '\xf9\xbe\xb4\xd9'
 BLOCKS_PATH = 'blocks.bin'
 genesis_block_hash = '000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f'
+addrtype = 0
 
 b58_digits = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
@@ -78,17 +80,34 @@ def float_to_btc (f):
 class BadAddress (Exception):
     pass
 
+def base58_encode_padded (s):
+    res = base58_encode (int ('0x' + s.encode ('hex'), 16))
+    pad = 0
+    for c in s:
+        if c == chr(0): pad += 1
+        else: break
+    return b58_digits[0] * pad + res
+
+def base58_decode_padded (s):
+    pad = 0
+    for c in s:
+        if c == b58_digits[0]: pad += 1
+        else: break
+    h = '%x' % base58_decode (s)
+    if len(h) % 2:
+        h = '0' + h
+    res = h.decode ('hex')
+    return chr(0) * pad + res
+
 def key_to_address (s):
-    checksum = dhash ('\x00' + s)[:4]
-    return '1' + base58_encode (
-        int ('0x' + (s + checksum).encode ('hex'), 16)
-        )
+    vs = chr (addrtype) + s
+    check = dhash(vs)[:4]
+    return base58_encode_padded (vs + check)
 
 def address_to_key (s):
-    # strip off leading '1'
-    s = ('%048x' % base58_decode (s[1:])).decode ('hex')
-    hash160, check0 = s[:-4], s[-4:]
-    check1 = dhash ('\x00' + hash160)[:4]
+    k = base58_decode_padded (s)
+    hash160, check0 = k[1:-4], k[-4:]
+    check1 = dhash (chr (addrtype) + hash160)[:4]
     if check0 != check1:
         raise BadAddress (s)
     return hash160
@@ -124,7 +143,6 @@ class wallet:
         self.path = path
         self.keys = {}
         self.addrs = {}
-        self.outpoints = {}
         # these will load from the cache
         self.last_block = 0
         self.total_btc = 0
@@ -179,10 +197,6 @@ class wallet:
             self.write_value_cache()
         else:
             print 'wallet cache is caught up with the block chain'
-        # update the outpoint map
-        for addr, outpoints in self.value.iteritems():
-            for outpoint, value in outpoints.iteritems():
-                self.outpoints[outpoint] = value
         print 'total btc in wallet:', bcrepr (self.total_btc)
 
     def write_value_cache (self):
@@ -222,7 +236,6 @@ class wallet:
                     else:
                         value = self.value[addr][outpoint]
                         self.value[addr][outpoint] = 0
-                        self.outpoints[outpoint] = 0
                         self.total_btc -= value
                         dirty = True
                     print 'SEND: %s %s' % (bcrepr (value), addr,)
@@ -232,15 +245,15 @@ class wallet:
         rtotal = 0
         index = 0
         for value, oscript in tx.outputs:
-            kind, addr = parse_oscript (oscript)
-            if kind == 'address' and self.addrs.has_key (addr):
+            addr = parse_oscript (oscript)
+            if addr and self.addrs.has_key (addr):
                 hash = tx.get_hash()
                 outpoint = hash, index
                 if self.value[addr].has_key (outpoint):
-                    raise KeyError ("outpoint already present?")
+                    #raise KeyError ("outpoint already present?")
+                    pass
                 else:
                     self.value[addr][outpoint] = value
-                    self.outpoints[outpoint] += value
                     self.total_btc += value
                     dirty = True
                 print 'RECV: %s %s' % (bcrepr (value), addr)
@@ -367,14 +380,9 @@ object_types = {
     2: "BLOCK"
     }
 
-MAX_BLOCK_SIZE = 1000000
-COIN = 100000000
-MAX_MONEY = 21000000 * COIN
-
 # used to keep track of the parsing position when cracking packets
 class position:
     def __init__ (self, val=0):
-        self.origin = val
         self.val = val
     def __int__ (self):
         return self.val
@@ -382,8 +390,6 @@ class position:
         return self.val
     def incr (self, delta):
         self.val += delta
-        if self.val - self.origin > MAX_BLOCK_SIZE:
-            raise ValueError ("data > MAX_BLOCK_SIZE")
     def __repr__ (self):
         return '<pos %d>' % (self.val,)
 
@@ -439,14 +445,11 @@ def pack_version (me_addr, you_addr, nonce):
     data += struct.pack ('<I', start_height)
     return make_packet ('version', data)
 
-NULL_OUTPOINT = ('\x00' * 32, 4294967295)
-
 class TX:
-    def __init__ (self, inputs, outputs, lock_time, raw=None):
+    def __init__ (self, inputs, outputs, lock_time):
         self.inputs = inputs
         self.outputs = outputs
         self.lock_time = lock_time
-        self.raw = raw
 
     def copy (self):
         return copy.deepcopy (self)
@@ -463,10 +466,10 @@ class TX:
         print '%d outputs' % (len(self.outputs))
         for i in range (len (self.outputs)):
             value, pk_script = self.outputs[i]
-            kind, addr = parse_oscript (pk_script)
+            addr = parse_oscript (pk_script)
             if not addr:
                 addr = hexify (pk_script)
-            print '%3d %s %s %r' % (i, bcrepr (value), kind, addr)
+            print '%3d %s %s' % (i, bcrepr (value), addr)
         print 'lock_time:', self.lock_time
 
     def render (self):
@@ -491,7 +494,6 @@ class TX:
         return ''.join (result)
 
     # Hugely Helpful: http://forum.bitcoin.org/index.php?topic=2957.20
-    # NOTE: this currently verifies only 'standard' address transactions.
     def get_ecdsa_hash (self, index):
         tx0 = self.copy()
         iscript = tx0.inputs[index][1]
@@ -520,19 +522,13 @@ class TX:
         return sig
 
     def verify (self, index):
-        outpoint, script, sequence = self.inputs[index]
-        if outpoint == NULL_OUTPOINT:
-            # generation is considered verified - I assume by virtue of its hash value?
-            return 1
-        else:
-            hash, sig, pubkey = self.get_ecdsa_hash (index)
-            k = KEY()
-            k.set_pubkey (pubkey)
-            return k.verify (hash, sig)
+        hash, sig, pubkey = self.get_ecdsa_hash (index)
+        k = KEY()
+        k.set_pubkey (pubkey)
+        return k.verify (hash, sig)
 
 def unpack_tx (data, pos):
     # has its own version number
-    pos0 = pos.val
     version, = unpack_pos ('<I', data, pos)
     if version != 1:
         raise ValueError ("unknown tx version: %d" % (version,))
@@ -554,15 +550,7 @@ def unpack_tx (data, pos):
         pos.incr (pk_script_length)
         outputs.append ((value, pk_script))
     lock_time, = unpack_pos ('<I', data, pos)
-    pos1 = pos.val
-    return TX (inputs, outputs, lock_time, data[pos0:pos1])
-
-# both generation and address push two values, so this is good for most things.
-
-# The two numbers pushed by the input script for generation are
-# *usually* a compact representation of the current target, and the
-# 'extraNonce'.  But there doesn't seem to be any requirement for that;
-# the eligius pool uses the string 'Elegius'.
+    return TX (inputs, outputs, lock_time)
 
 def parse_iscript (s):
     # these tend to be push, push
@@ -570,12 +558,14 @@ def parse_iscript (s):
     if s0 > 0 and s0 < 76:
         # specifies the size of the first key
         k0 = s[1:1+s0]
+        #print 'k0:', hexify (k0)
         if len(s) == 1+s0:
             return k0, None
         else:
             s1 = ord (s[1+s0])
             if s1 > 0 and s1 < 76:
                 k1 = s[2+s0:2+s0+s1]
+                #print 'k1:', hexify (k1)
                 return k0, k1
             else:
                 return None, None
@@ -583,39 +573,114 @@ def parse_iscript (s):
         return None, None
 
 def make_iscript (sig, pubkey):
-    # XXX assert length limits
     sl = len (sig)
     kl = len (pubkey)
     return chr(sl) + sig + chr(kl) + pubkey
 
 def parse_oscript (s):
     if (ord(s[0]) == 118 and ord(s[1]) == 169 and ord(s[-2]) == 136 and ord(s[-1]) == 172):
-        # standard address output: OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG
         size = ord(s[2])
         addr = key_to_address (s[3:size+3])
         assert (size+5 == len(s))
-        return 'address', addr
-    elif ord(s[0]) == (len(s) - 2) and ord (s[-1]) == 0xac:
-        # generation: <pubkey>, OP_CHECKSIG
-        return 'pubkey', s[1:-1]
+        return addr
     else:
-        return 'unknown', s
+        return None
 
 def make_oscript (addr):
     # standard tx oscript
     key_hash = address_to_key (addr)
     return chr(118) + chr(169) + chr(len(key_hash)) + key_hash + chr(136) + chr(172)
 
+def inet_ntop(af, addr):
+    if af == socket.AF_INET:
+        return socket.inet_ntoa(addr)
+    elif af == socket.AF_INET6:
+        if len(addr) != 16:
+            raise ValueError("address length incorrect")
+        parts = struct.unpack('!8H', addr)
+        curBase = bestBase = None
+        for i in range(8):
+            if not parts[i]:
+                if curBase is None:
+                    curBase = i
+                    curLen = 0
+                curLen += 1
+            else:
+                if curBase is not None:
+                    if bestBase is None or curLen > bestLen:
+                        bestBase = curBase
+                        bestLen = curLen
+                    curBase = None
+        if curBase is not None and (bestBase is None or curLen > bestLen):
+            bestBase = curBase
+            bestLen = curLen
+        parts = [hex(x)[2:] for x in parts]
+        if bestBase is not None:
+            parts[bestBase:bestBase + bestLen] = ['']
+        if parts[0] == '':
+            parts.insert(0, '')
+        if parts[-1] == '':
+            parts.insert(len(parts) - 1, '')
+        return ':'.join(parts)
+    else:
+        raise socket.error(97, 'Address family not supported by protocol')
+
 def read_ip_addr (s):
-    r = socket.inet_ntop (socket.AF_INET6, s)
+    r = inet_ntop (socket.AF_INET6, s)
     if r.startswith ('::ffff:'):
         return r[7:]
     else:
         return r
 
+def inet_pton(af, addr):
+    if af == socket.AF_INET:
+        return socket.inet_aton(addr)
+    elif af == getattr(socket, 'AF_INET6', 'AF_INET6'):
+        if [x for x in addr if x not in string.hexdigits + ':.']:
+            raise ValueError("Illegal characters: %r" % (''.join(x),))
+
+        parts = addr.split(':')
+        elided = parts.count('')
+        ipv4Component = '.' in parts[-1]
+
+        if len(parts) > (8 - ipv4Component) or elided > 3:
+            raise ValueError("Syntactically invalid address")
+
+        if elided == 3:
+            return '\x00' * 16
+
+        if elided:
+            zeros = ['0'] * (8 - len(parts) - ipv4Component + elided)
+
+            if addr.startswith('::'):
+                parts[:2] = zeros
+            elif addr.endswith('::'):
+                parts[-2:] = zeros
+            else:
+                idx = parts.index('')
+                parts[idx:idx+1] = zeros
+
+            if len(parts) != 8 - ipv4Component:
+                raise ValueError("Syntactically invalid address")
+        else:
+            if len(parts) != (8 - ipv4Component):
+                raise ValueError("Syntactically invalid address")
+
+        if ipv4Component:
+            if parts[-1].count('.') != 3:
+                raise ValueError("Syntactically invalid address")
+            rawipv4 = socket.inet_aton(parts[-1])
+            unpackedipv4 = struct.unpack('!HH', rawipv4)
+            parts[-1:] = [hex(x)[2:] for x in unpackedipv4]
+
+        parts = [int(x, 16) for x in parts]
+        return struct.pack('!8H', *parts)
+    else:
+        raise socket.error(97, 'Address family not supported by protocol')
+
 def pack_ip_addr (addr):
     # only v4 right now
-    return socket.inet_pton (socket.AF_INET6, '::ffff:%s' % (addr,))
+    return inet_pton (socket.AF_INET6, '::ffff:%s' % (addr,))
 
 def pack_var_int (n):
     if n < 0xfd:
@@ -696,85 +761,28 @@ def unpack_getdata (data, pos):
     # identical to INV
     return unpack_inv (data, pos)
 
-class BadBlock (Exception):
-    pass
-
 class BLOCK:
-    def __init__ (self, prev_block, merkle_root, timestamp, bits, nonce, transactions, raw=None):
-        self.version = 1
-        self.prev_block = hexify (prev_block, True)
+    def __init__ (self, prev_block, merkle_root, timestamp, bits, nonce, transactions):
+        self.prev_block = prev_block
         self.merkle_root = merkle_root
         self.timestamp = timestamp
         self.bits = bits
         self.nonce = nonce
         self.transactions = transactions
-        self.raw = raw
 
-    def check_bits (self):
-        shift  = self.bits >> 24
-        target = (self.bits & 0xffffff) * (1 << (8 * (shift - 3)))
-        hash = self.get_hash (hex=False)[::-1]
-        val = int (hash.encode ('hex'), 16)
-        return val < target
-
-    def get_merkle_hash (self):
-        hl = [dhash (t.raw) for t in self.transactions]
-        while 1:
-            if len(hl) == 1:
-                return hl[0]
-            if len(hl) % 2 != 0:
-                hl.append (hl[-1])
-            hl0 = []
-            for i in range (0, len (hl), 2):
-                hl0.append (dhash (hl[i] + hl[i+1]))
-            hl = hl0
-
-    # see https://en.bitcoin.it/wiki/Protocol_rules
-    def check_rules (self):
-        if not len(self.transactions):
-            raise BadBlock ("zero transactions")
-        elif not self.check_bits():
-            raise BadBlock ("did not achieve target")
-        elif (time.time() - self.timestamp) < (-60 * 60 * 2):
-            raise BadBlock ("block from the future")
-        else:
-            for i in range (len (self.transactions)):
-                tx = self.transactions[i]
-                if i == 0 and (len (tx.inputs) != 1 or tx.inputs[0][0] != NULL_OUTPOINT):
-                    raise BadBlock ("first transaction not a generation")
-                elif i == 0 and not (2 <= len (tx.inputs[0][1]) <= 100):
-                    raise BadBlock ("bad sig_script in generation transaction")
-                elif i > 0:
-                    for outpoint, sig_script, sequence in tx.inputs:
-                        if outpoint == NULL_OUTPOINT:
-                            raise BadBlock ("transaction other than the first is a generation")
-                for value, _ in tx.outputs:
-                    if value > MAX_MONEY:
-                        raise BadBlock ("too much money")
-                    # XXX not checking SIGOP counts since we don't really implement the script engine.
-            # check merkle hash
-            if self.merkle_root != self.get_merkle_hash():
-                raise BadBlock ("merkle hash doesn't match")
-        # XXX more to come...
-
-    def get_hash (self, hex=True):
-        # reconstruct the 80-byte header
-        header = struct.pack (
-            '<I32s32sIII', 
-            self.version, unhexify (self.prev_block, True),
-            self.merkle_root, self.timestamp, self.bits, self.nonce
+    def get_hash (self):
+        return hexify (
+            struct.pack (
+                '<I32s32sIII', 
+                self.version, self.prev_block, self.merkle_root,
+                self.timestamp, self.bits, self.nonce
+                ),
+            True
             )
-        # dhash it
-        hash = dhash (header)
-        if hex:
-            return hexify (hash)
-        else:
-            return hash
 
 def unpack_block (data, pos=None):
     if pos is None:
         pos = position()
-    pos0 = pos.val
     version, prev_block, merkle_root, timestamp, bits, nonce = unpack_pos ('<I32s32sIII', data, pos)
     if version != 1:
         raise ValueError ("unsupported block version: %d" % (version,))
@@ -782,8 +790,7 @@ def unpack_block (data, pos=None):
     transactions = []
     for i in range (count):
         transactions.append (unpack_tx (data, pos))
-    pos1 = pos.val
-    return BLOCK (prev_block, merkle_root, timestamp, bits, nonce, transactions, raw=data[pos0:pos1])
+    return BLOCK (prev_block, merkle_root, timestamp, bits, nonce, transactions)
 
 def unpack_block_header (data):
     # version, prev_block, merkle_root, timestamp, bits, nonce
@@ -866,15 +873,16 @@ class block_db:
     def __getitem__ (self, name):
         return unpack_block (self.get_block (name))
 
-    def by_num (self, num):
-        return self[self.num_block[num]]
-
     def add (self, name, block):
+        header = block[:80]
+        (version, prev_block, merkle_root,
+         timestamp, bits, nonce) = unpack_block_header (header)
+        prev_block = hexify (prev_block, True)
         if self.blocks.has_key (name):
             print 'ignoring block we already have:', name
         else:
             for name0, block0 in self.embargo.iteritems():
-                if name0 == block.prev_block:
+                if name0 == prev_block:
                     # case 0: it links to an embargo block (normal case)
                     #    * release that embargo block
                     #    * toss any other embargo blocks
@@ -888,7 +896,7 @@ class block_db:
                     self.embargo = { name:block }
                     break
             else:
-                if block.prev_block == self.last_block:
+                if prev_block == self.last_block:
                     # case 1: it links to the last block (racing blocks / competing subnet)
                     #    * add to the embargo list
                     self.embargo[name] = block
@@ -896,36 +904,46 @@ class block_db:
                     # case 2: it links to neither (problem or lame hack attempt?)
                     #    * toss it
                     print 'tossing orphan block: %s' % (name,)
-                    self.toss_orphan_blocks ([(name, block)])
+                    self.orphan_blocks ([(name, block)])
+
+            if name == genesis_block_hash:
+                print "we got genesis block"
+                self.last_block = '00' * 32
+                self.prev[self.last_block] = True
+                self.release_embargo(name, block)
+                del self.embargo[name]
 
     def toss_orphan_blocks (self, orphans):
         # for now, just dump them into a binary log file
         f = open ('orphans.bin', 'ab')
-        for name, block in orphans:
-            f.write (struct.pack ('<Q', len(block.raw)))
-            f.write (block.raw)
+        for name, orphan in orphans:
+            f.write (struct.pack ('<Q', len(block)))
+            f.write (block)
         f.close()
 
     def release_embargo (self, name, block):
         if self.file is None:
             self.open_for_append()
-        if self.has_key (block.prev_block):
-            size = len (block.raw)
+        (version, prev_block, merkle_root,
+         timestamp, bits, nonce) = unpack_block_header (block[:80])
+        prev_block = hexify (prev_block, True)
+        if self.has_key (prev_block):
+            size = len (block)
             pos = self.file.tell()
             self.file.write (struct.pack ('<Q', size))
-            self.file.write (block.raw)
+            self.file.write (block)
             self.file.flush()
-            self.prev[name] = block.prev_block
-            self.next[block.prev_block] = name
+            self.prev[name] = prev_block
+            self.next[prev_block] = name
             self.blocks[name] = pos
             print 'wrote block %s' % (name,)
-            i = self.block_num[block.prev_block]
+            i = self.block_num[prev_block]
             self.block_num[name] = i+1
             self.num_block[i+1] = name
             self.last_block = name
             self.last_block_index = i+1
             if the_wallet:
-                the_wallet.new_block (block)
+                the_wallet.new_block (unpack_block (block))
         else:
             print 'cannot chain block %s' % (name,)
 
@@ -966,7 +984,6 @@ class connection (asynchat.async_chat):
         self.seeking = []
         self.pending = {}
         self.state_header()
-        self.packet_count = 0
         self.connect ((addr, BITCOIN_PORT))
         if not the_block_db.prev:
             # totally empty block database, seek the genesis block
@@ -974,14 +991,6 @@ class connection (asynchat.async_chat):
 
     def collect_incoming_data (self, data):
         self.ibuffer.append (data)
-
-    def handle_error (self):
-        print 'error on %r' % (self,)
-        try:
-            the_connection_list.remove (self)
-        except ValueError:
-            pass
-        self.close()
 
     def handle_connect (self):
         self.push (
@@ -991,13 +1000,6 @@ class connection (asynchat.async_chat):
                 self.nonce
                 )
             )
-        the_connection_list.append (self)
-
-    def handle_close (self):
-        try:
-            the_connection_list.remove (self)
-        except:
-            pass
 
     def state_header (self):
         self.state = HEADER
@@ -1024,8 +1026,6 @@ class connection (asynchat.async_chat):
             # ok, we got a header
             magic, command, length = struct.unpack ('<I12sI', data)
             command = command.strip ('\x00')
-            print 'cmd:', command
-            self.packet_count += 1
             self.header = magic, command, length
             if command not in ('version', 'verack'):
                 self.state_checksum()
@@ -1126,7 +1126,6 @@ class connection (asynchat.async_chat):
         for objid, hash in pairs:
             if objid == OBJ_BLOCK:
                 name = hexify (hash, True)
-                # XXX check the embargo first!!!
                 if not the_block_db.has_key (name):
                     self.seeking.append (name)
         self.kick_seeking()
@@ -1142,104 +1141,59 @@ class connection (asynchat.async_chat):
         #  lives in the first 80 bytes.
         name = hexify (dhash (data[:80]), True)
         # were we waiting for this block?
-        # XXX check the embargo as well
         if self.pending.has_key (name):
             del self.pending[name]
-        b = unpack_block (data)
-        try:
-            b.check_rules()
-        except BadBlock as reason:
-            print "*** bad block: %s %r" % (name, reason,)
-        else:
-            the_block_db.add (name, b)
+        the_block_db.add (name, data)
         self.kick_seeking()
 
-    def cmd_ping (self, data):
-        # do nothing
-        pass
+def valid_ip (s):
+    parts = s.split ('.')
+    nums = map (int, parts)
+    assert (len (nums) == 4)
+    for num in nums:
+        if num > 255:
+            raise ValueError
 
-    def cmd_alert (self, data):
-        pos = position()
-        payload   = unpack_var_str (data, pos)
-        signature = unpack_var_str (data, pos)
-        # XXX verify signature
-        print 'alert: %r' % (payload,)
 
 the_wallet = None
 the_block_db = None
-the_connection_list = []
-
-dns_seeds = [
-    "bitseed.xf2.org",
-    "bitseed.bitcoin.org.uk",
-    "dnsseed.bluematt.me",
-    ]
-
-def valid_ip (s):
-    try:
-        parts = s.split ('.')
-        nums = map (int, parts)
-        assert (len (nums) == 4)
-        for num in nums:
-            if num > 255:
-                raise ValueError
-    except:
-        raise ValueError ("not a valid IP: %r" % (s,))
-
-def dns_seed():
-    print 'fetching DNS seed addresses...'
-    addrs = set()
-    for name in dns_seeds:
-        for info in socket.getaddrinfo (name, 8333):
-            family, type, proto, _, addr = info
-            if family == socket.AF_INET and type == socket.SOCK_STREAM and proto == socket.IPPROTO_TCP:
-                addrs.add (addr[0])
-    print '...done.'
-    return addrs
 
 if __name__ == '__main__':
     if '-t' in sys.argv:
+        sys.argv.remove ('-t')
         BITCOIN_PORT = 18333
         BITCOIN_MAGIC = '\xfa\xbf\xb5\xda'
         BLOCKS_PATH = 'blocks.testnet.bin'
         genesis_block_hash = '00000007199508e34a9ff81e6ec0c477a4cccff2a4767a8eee39c11db367b008'
+        addrtype = 111
 
     # mount the block database
     the_block_db = block_db()
-    network = False
 
     if '-w' in sys.argv:
         i = sys.argv.index ('-w')
         the_wallet = wallet (sys.argv[i+1])
+        del sys.argv[i:i+2]
 
     # client mode
     if '-c' in sys.argv:
         i = sys.argv.index ('-c')
-        [my_addr, other_addr] = sys.argv[i+1:i+3]
-        bc = connection (other_addr)
-        network = True
-
-    # network mode
-    if '-n' in sys.argv:
-        i = sys.argv.index ('-n')
-        my_addr = sys.argv[i+1]
-        addrs = dns_seed()
-        for addr in addrs:
-            connection (addr)
-        network = True
-
-    do_monitor = '-m' in sys.argv
-    do_admin   = '-a' in sys.argv
-
-    if network:
-        if do_monitor:
+        if len(sys.argv) < 3:
+            print 'usage: %s -c <externally-visible-ip-address> <server-ip-address>' % (sys.argv[0],)
+        else:
+            [my_addr, other_addr] = sys.argv[i+1:i+3]
+            valid_ip (my_addr)
             import monitor
+            # for now, there's a single global connection.  later we'll have a bunch.
+            bc = connection (other_addr)
             m = monitor.monitor_server()
-        if do_admin:
             h = asynhttp.http_server ('127.0.0.1', 8380)
             import webadmin
             h.install_handler (webadmin.handler())
-        asyncore.loop()
+            try:
+                asyncore.loop(timeout = 5)
+            except:
+                print("received interrupt signal, stopping")
     else:
         # database browsing mode
         db = the_block_db # alias
