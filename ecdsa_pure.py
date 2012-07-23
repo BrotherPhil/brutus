@@ -1,115 +1,107 @@
 # -*- Mode: Python -*-
 
-# If you can't (or don't want to) use the ctypes ssl code, this drop-in
-#   replacement uses the pure-python ecdsa package.  Note: it stores private keys
-#   using an OID to indicate the curve, while openssl puts the curve parameters
-#   in each key.  The ecdsa package doesn't understand that DER, though.  So if you
-#   create a wallet using one version, you must continue to use that version.  In an
-#   emergency you could write a converter.
-
-#
-# https://github.com/warner/python-ecdsa
-# $ easy_install ecdsa
-#
-
-# curve parameters below were taken from: 
-#  http://forum.bitcoin.org/index.php?topic=23241.msg292364#msg292364
-
-# WORRY: are the random numbers from random.SystemRandom() good enough?
+# python-ecdsa wrapper
+# see https://github.com/warner/python-ecdsa
+# see http://lapo.it/asn1js/
 
 import ecdsa
 import random
 from ecdsa import der
 
-# secp256k1
-_p  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2FL
-_r  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141L
-_b  = 0x0000000000000000000000000000000000000000000000000000000000000007L
 _a  = 0x0000000000000000000000000000000000000000000000000000000000000000L
+_b  = 0x0000000000000000000000000000000000000000000000000000000000000007L
+_p  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2FL
 _Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798L
 _Gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8L
+_r  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141L
+_oid = (1, 3, 132, 0, 10)
 
-curve_secp256k1 = ecdsa.ellipticcurve.CurveFp (_p, _a, _b)
-generator_secp256k1 = g = ecdsa.ellipticcurve.Point (curve_secp256k1, _Gx, _Gy, _r)
+curve = ecdsa.ellipticcurve.CurveFp(_p, _a, _b)
+gen = ecdsa.ellipticcurve.Point(curve, _Gx, _Gy, _r)
 randrange = random.SystemRandom().randrange
-secp256k1 = ecdsa.curves.Curve (
-    "secp256k1",
-    curve_secp256k1,
-    generator_secp256k1,
-    (1, 3, 132, 0, 10)
-    )
-# add this to the list of official NIST curves.
-ecdsa.curves.curves.append (secp256k1)
+secp256k1 = ecdsa.curves.Curve("secp256k1", curve, gen, _oid)
+ecdsa.curves.curves.append(secp256k1)
 
 class KEY:
 
-    def __init__ (self):
+    def __init__(self):
         self.prikey = None
         self.pubkey = None
+        self.compressed = False
+        self.secret = None
 
-    def generate (self, secret=None):
+    def generate(self, secret=None):
         if secret:
-            exp = int ('0x' + secret.encode ('hex'), 16)
-            self.prikey = ecdsa.SigningKey.from_secret_exponent (exp, curve=secp256k1)
+            self.prikey = ecdsa.SigningKey.from_string(secret, curve=secp256k1)
         else:
-            self.prikey = ecdsa.SigningKey.generate (curve=secp256k1)
+            self.prikey = ecdsa.SigningKey.generate(curve=secp256k1)
         self.pubkey = self.prikey.get_verifying_key()
         return self.prikey.to_der()
 
-    def set_privkey (self, key):
-        if len(key) == 279:
-            seq1, rest = der.remove_sequence (key)
-            integer, rest = der.remove_integer (seq1)
-            octet_str, rest = der.remove_octet_string (rest)
-            tag1, cons1, rest, = der.remove_constructed (rest)
-            tag2, cons2, rest, = der.remove_constructed (rest)
-            point_str, rest = der.remove_bitstring (cons2)
-            self.prikey = ecdsa.SigningKey.from_string (octet_str, curve=secp256k1)
+    def set_privkey(self, key):
+        if len(key) >= 214:
+            seq1, rest = der.remove_sequence(key)
+            integer, rest = der.remove_integer(seq1)
+            secret, rest = der.remove_octet_string(rest)
+            tag1, cons1, rest, = der.remove_constructed(rest)
+            tag2, cons2, rest, = der.remove_constructed(rest)
+            point_str, rest = der.remove_bitstring(cons2)
+            self.compressed = ord(point_str[1]) != 4
+            self.prikey = ecdsa.SigningKey.from_string(secret, curve=secp256k1)
         else:
-            self.prikey = ecdsa.SigningKey.from_der (key)
+            self.prikey = ecdsa.SigningKey.from_der(key)
+        self.pubkey = self.prikey.get_verifying_key()
 
-    def set_pubkey (self, key):
+    def set_pubkey(self, key):
         key = key[1:]
-        self.pubkey = ecdsa.VerifyingKey.from_string (key, curve=secp256k1)
+        self.pubkey = ecdsa.VerifyingKey.from_string(key, curve=secp256k1)
 
-    def get_privkey (self):
-        _p = self.prikey.curve.curve.p ()
-        _r = self.prikey.curve.generator.order () # key.curve.order
-        _Gx = self.prikey.curve.generator.x ()
-        _Gy = self.prikey.curve.generator.y ()
-        encoded_oid2 = der.encode_oid (*(1, 2, 840, 10045, 1, 1))
-        encoded_gxgy = "\x04" + ("%64x" % _Gx).decode('hex') + ("%64x" % _Gy).decode('hex')
-        param_sequence = der.encode_sequence (
-            ecdsa.der.encode_integer(1),
-                der.encode_sequence (
-                encoded_oid2,
-                der.encode_integer (_p),
+    def encode_point(self, p):
+        order = self.prikey.curve.generator.order()
+        x_str = ecdsa.util.number_to_string(p.x(), order)
+        y_str = ecdsa.util.number_to_string(p.y(), order)
+        if self.compressed:
+            return chr(2 + (p.y() & 1)) + x_str
+        else:
+            return chr(4) + x_str + y_str
+
+    def get_privkey(self):
+        return der.encode_sequence(
+            der.encode_integer(1),
+            der.encode_octet_string(self.prikey.to_string()),
+            der.encode_constructed(0,
+                der.encode_sequence(
+                    ecdsa.der.encode_integer(1),
+                    der.encode_sequence(
+                        der.encode_oid(*(1, 2, 840, 10045, 1, 1)),
+                        der.encode_integer(self.prikey.curve.curve.p()),
+                    ),
+                    der.encode_sequence(
+                        der.encode_octet_string(chr(0)),
+                        der.encode_octet_string(chr(7)),
+                    ),
+                    der.encode_octet_string(self.encode_point(self.prikey.curve.generator)),
+                    der.encode_integer(self.prikey.curve.generator.order()),
+                    der.encode_integer(1)
+                )
             ),
-            der.encode_sequence (
-                der.encode_octet_string("\x00"),
-                der.encode_octet_string("\x07"),
+            der.encode_constructed(1, 
+                der.encode_bitstring(chr(0) + self.encode_point(self.pubkey.pubkey.point))
             ),
-            der.encode_octet_string (encoded_gxgy),
-            der.encode_integer (_r),
-            der.encode_integer (1),
-        );
-        encoded_vk = "\x00\x04" + self.pubkey.to_string ()
-        return der.encode_sequence (
-            der.encode_integer (1),
-            der.encode_octet_string (self.prikey.to_string ()),
-            der.encode_constructed (0, param_sequence),
-            der.encode_constructed (1, der.encode_bitstring (encoded_vk)),
         )
 
-    def get_pubkey (self):
-        return "\x04" + self.pubkey.to_string()
+    def get_pubkey(self):
+        return self.encode_point(self.pubkey.pubkey.point)
 
-    def sign (self, hash):
-        sig = self.prikey.sign_digest (hash, sigencode=ecdsa.util.sigencode_der)
+    def sign(self, hash):
+        sig = self.prikey.sign_digest(hash, sigencode=ecdsa.util.sigencode_der)
         return sig.to_der()
 
-    def verify (self, hash, sig):
-        return self.pubkey.verify_digest (sig[:-1], hash, sigdecode=ecdsa.util.sigdecode_der)
+    def verify(self, hash, sig):
+        return self.pubkey.verify_digest(sig[:-1], hash, sigdecode=ecdsa.util.sigdecode_der)
+
+    def set_compressed(self, compressed=False):
+        self.compressed = compressed
 
 if __name__ == '__main__':
     # ethalone keys
@@ -128,8 +120,7 @@ if __name__ == '__main__':
         'a762fbc6ac0921b8f17025bb8458b92794ae87a133894d70d7995fc0b6b5ab90'
 
     k = KEY()
-    print ec_private
     k.generate (ec_secret.decode('hex'))
+    k.set_compressed(True)
     print k.get_privkey ().encode('hex')
-    k.set_privkey (k.get_privkey ())
-    print k.get_privkey ().encode('hex')
+    print k.get_pubkey().encode('hex')
