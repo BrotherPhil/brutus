@@ -1,8 +1,7 @@
 This is a fork of Caesure bitcoin client, renamed to Brutus
 I had to add a few fixes to work with testnet-in-a-box on win32 machine.
 
-You may try to replace ecdsa_ssl with ecdsa_pure + python-ecdsa package,
-but check all outputs carefully, looks like there is a bug.
+You may replace ecdsa_ssl with ecdsa_pure + python-ecdsa package:
 https://github.com/warner/python-ecdsa
 
 How to use:
