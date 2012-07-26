@@ -103,6 +103,9 @@ class KEY:
     def set_compressed(self, compressed=False):
         self.compressed = compressed
 
+    def get_secret(self):
+        return self.prikey.to_string()
+
 if __name__ == '__main__':
     # ethalone keys
     ec_secret = '' + \
@@ -124,3 +127,4 @@ if __name__ == '__main__':
     k.set_compressed(True)
     print k.get_privkey ().encode('hex')
     print k.get_pubkey().encode('hex')
+    print k.get_secret().encode('hex')
